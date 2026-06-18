@@ -1,17 +1,21 @@
 import { getModel } from "@mariozechner/pi-ai";
-import type { Tool } from "@mariozechner/pi-ai";
 import { getOAuthApiKey, type OAuthCredentials } from "@mariozechner/pi-ai/oauth";
 import { Input, ProcessTerminal, TUI, type Component, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { readFile, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { promisify } from "node:util";
 import { Type } from "typebox";
-import { Runtime } from "./runtime.js";
+import { Runtime, type RuntimeTool } from "./runtime.js";
 
 type AuthFile = Record<string, OAuthCredentials & { type?: string }>;
 type ChatLine = { role: "user" | "assistant" | "system"; text: string };
 
 const authPath = new URL("./auth.json", import.meta.url);
+const workspaceRoot = process.cwd();
+const execFileAsync = promisify(execFile);
 const model = getModel("openai-codex", "gpt-5.4-mini");
-const tools: Tool[] = [
+const tools: RuntimeTool[] = [
   {
     name: "bash",
     description:
@@ -20,6 +24,21 @@ const tools: Tool[] = [
       command: Type.String({ description: "The shell command to run." }),
       timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds." })),
     }),
+    execute: async (args) => {
+      const command = requireString(args.command, "command");
+      const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : 30_000;
+      const shell = process.platform === "win32" ? "powershell.exe" : "sh";
+      const shellArgs =
+        process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
+
+      const { stdout, stderr } = await execFileAsync(shell, shellArgs, {
+        cwd: workspaceRoot,
+        timeout: timeoutMs,
+        maxBuffer: 1024 * 1024,
+      });
+
+      return trimToolOutput([stdout, stderr && `stderr:\n${stderr}`].filter(Boolean).join("\n"));
+    },
   },
   {
     name: "read_file",
@@ -29,6 +48,15 @@ const tools: Tool[] = [
       startLine: Type.Optional(Type.Number({ description: "Optional 1-based line number to start reading from." })),
       lineLimit: Type.Optional(Type.Number({ description: "Optional maximum number of lines to read." })),
     }),
+    execute: async (args) => {
+      const path = resolveWorkspacePath(requireString(args.path, "path"));
+      const text = await readFile(path, "utf8");
+      const startLine = typeof args.startLine === "number" ? Math.max(1, Math.floor(args.startLine)) : 1;
+      const lineLimit = typeof args.lineLimit === "number" ? Math.max(1, Math.floor(args.lineLimit)) : undefined;
+      const lines = text.split(/\r?\n/);
+      const selected = lines.slice(startLine - 1, lineLimit ? startLine - 1 + lineLimit : undefined);
+      return trimToolOutput(selected.map((line, index) => `${startLine + index}: ${line}`).join("\n"));
+    },
   },
   {
     name: "write_file",
@@ -37,6 +65,13 @@ const tools: Tool[] = [
       path: Type.String({ description: "Path to the file to write, relative to the workspace when possible." }),
       content: Type.String({ description: "Full file content to write." }),
     }),
+    execute: async (args) => {
+      const path = resolveWorkspacePath(requireString(args.path, "path"));
+      const content = requireString(args.content, "content");
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content, "utf8");
+      return `Wrote ${content.length} characters to ${path}.`;
+    },
   },
 ];
 
@@ -161,6 +196,18 @@ const runtime = new Runtime({
         text: `Tool call final: ${event.toolCall.name}\n${JSON.stringify(event.toolCall.arguments, null, 2)}`,
       });
     }
+    if (event.type === "tool_execution_start") {
+      screen.addLine({ role: "system", text: `Executing tool: ${event.toolCall.name}` });
+    }
+    if (event.type === "tool_execution_result") {
+      const content = event.message.content
+        .map((item) => (item.type === "text" ? item.text : `[${item.type}]`))
+        .join("\n");
+      screen.addLine({
+        role: "system",
+        text: `Tool result: ${event.toolCall.name}${event.message.isError ? " (error)" : ""}\n${content}`,
+      });
+    }
     if (event.type === "runtime_error") screen.addLine({ role: "system", text: event.error });
   },
 });
@@ -210,3 +257,21 @@ tui.addInputListener((data) => {
 tui.addChild(screen);
 tui.setFocus(screen);
 tui.start();
+
+function requireString(value: unknown, name: string) {
+  if (typeof value !== "string") throw new Error(`Expected '${name}' to be a string.`);
+  return value;
+}
+
+function resolveWorkspacePath(path: string) {
+  const resolved = resolve(workspaceRoot, path);
+  if (!resolved.startsWith(workspaceRoot)) {
+    throw new Error(`Path escapes workspace: ${path}`);
+  }
+  return resolved;
+}
+
+function trimToolOutput(output: string, maxLength = 20_000) {
+  if (output.length <= maxLength) return output || "(no output)";
+  return `${output.slice(0, maxLength)}\n\n[Output truncated after ${maxLength} characters]`;
+}
