@@ -5,10 +5,10 @@
   "private": true,
   "scripts": {
     "build": "tsc",
-    "chat": "bun run index.ts",
+    "start": "bun run index.ts",
     "providers": "pi-ai list",
     "login": "pi-ai login",
-    "login:codex": "pi-ai login openai-codex",
+    "login:codex": "bun run login.ts",
     "login:copilot": "pi-ai login github-copilot",
     "login:anthropic": "pi-ai login anthropic"
   },
@@ -19,8 +19,8 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "^0.79.4",
-    "@mariozechner/pi-agent-core": "^0.73.1",
-    "@mariozechner/pi-ai": "^0.73.1"
+    "@earendil-works/pi-tui": "^0.79.7",
+    "@mariozechner/pi-ai": "^0.73.1",
+    "typebox": "^1.2.16"
   }
 }

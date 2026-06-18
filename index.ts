@@ -1,205 +1,212 @@
-import { Agent } from "@mariozechner/pi-agent-core";
-import { getModel, getModels, type Model } from "@mariozechner/pi-ai";
-import {
-  Container,
-  Input,
-  Key,
-  matchesKey,
-  ProcessTerminal,
-  Text,
-  TUI,
-} from "@earendil-works/pi-tui";
-import { getAuthFilePath, resolveOAuthApiKey } from "./auth";
-import { defaultTools } from "./tools";
-import { UiMessageList } from "./ui/messages";
+import { getModel } from "@mariozechner/pi-ai";
+import type { Tool } from "@mariozechner/pi-ai";
+import { getOAuthApiKey, type OAuthCredentials } from "@mariozechner/pi-ai/oauth";
+import { Input, ProcessTerminal, TUI, type Component, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { readFile, writeFile } from "node:fs/promises";
+import { Type } from "typebox";
+import { Runtime } from "./runtime.js";
 
-type RuntimeProvider = "anthropic" | "github-copilot" | "openai-codex";
+type AuthFile = Record<string, OAuthCredentials & { type?: string }>;
+type ChatLine = { role: "user" | "assistant" | "system"; text: string };
 
-function resolveProvider(): RuntimeProvider {
-  const provider = process.env.AI_PROVIDER;
-  if (
-    provider === "anthropic" ||
-    provider === "github-copilot" ||
-    provider === "openai-codex"
-  ) {
-    return provider;
-  }
+const authPath = new URL("./auth.json", import.meta.url);
+const model = getModel("openai-codex", "gpt-5.4-mini");
+const tools: Tool[] = [
+  {
+    name: "bash",
+    description:
+      "Run a shell command in the current project workspace. Use this for inspecting files, running builds, tests, and other terminal commands.",
+    parameters: Type.Object({
+      command: Type.String({ description: "The shell command to run." }),
+      timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds." })),
+    }),
+  },
+  {
+    name: "read_file",
+    description: "Read a text file from the current project workspace.",
+    parameters: Type.Object({
+      path: Type.String({ description: "Path to the file to read, relative to the workspace when possible." }),
+      startLine: Type.Optional(Type.Number({ description: "Optional 1-based line number to start reading from." })),
+      lineLimit: Type.Optional(Type.Number({ description: "Optional maximum number of lines to read." })),
+    }),
+  },
+  {
+    name: "write_file",
+    description: "Write text content to a file in the current project workspace.",
+    parameters: Type.Object({
+      path: Type.String({ description: "Path to the file to write, relative to the workspace when possible." }),
+      content: Type.String({ description: "Full file content to write." }),
+    }),
+  },
+];
 
-  return "openai-codex";
+async function loadAuth() {
+  const text = await readFile(authPath, "utf8").catch(() => "{}");
+  return JSON.parse(text) as AuthFile;
 }
 
-function resolveModel(provider: RuntimeProvider): Model<any> {
-  const requestedModel = process.env.AI_MODEL;
-  const availableModels = getModels(provider);
-  const matchingModel = requestedModel
-    ? availableModels.find((candidate) => candidate.id === requestedModel)
-    : undefined;
-
-  if (matchingModel) {
-    return matchingModel;
-  }
-
-  switch (provider) {
-    case "anthropic":
-      return getModel("anthropic", "claude-sonnet-4-20250514");
-    case "github-copilot":
-      return getModel("github-copilot", "gpt-5-mini");
-    case "openai-codex":
-      return getModel("openai-codex", "gpt-5.4-mini");
-  }
+async function saveAuth(auth: AuthFile) {
+  await writeFile(authPath, `${JSON.stringify(auth, null, 2)}\n`);
 }
 
-const provider = resolveProvider();
-const model = resolveModel(provider);
+class ChatScreen implements Component {
+  readonly input = new Input();
+  focused = false;
+  private lines: ChatLine[] = [
+    { role: "system", text: "CodingAgent runtime chat. Press Esc or type /exit to quit." },
+  ];
 
-const agent = new Agent({
-  initialState: {
-    systemPrompt:
-      "You are an assistant made to test a harness. You have to provide technincal feedback.",
-    model,
-    tools: defaultTools,
-  },
-  getApiKey: async (requestedProvider) => {
-    return await resolveOAuthApiKey(requestedProvider);
-  },
-});
+  constructor(private readonly requestRender: () => void) {
+    this.input.onSubmit = (value) => {
+      const text = value.trim();
+      this.input.setValue("");
+      this.requestRender();
+      if (text) void this.onSubmit?.(text);
+    };
+  }
+
+  onSubmit?: (text: string) => void | Promise<void>;
+  onEscape?: () => void;
+
+  addLine(line: ChatLine) {
+    this.lines.push(line);
+    this.requestRender();
+  }
+
+  appendAssistant(delta: string) {
+    const last = this.lines.at(-1);
+    if (last?.role === "assistant") {
+      last.text += delta;
+    } else {
+      this.lines.push({ role: "assistant", text: delta });
+    }
+    this.requestRender();
+  }
+
+  appendSystem(delta: string) {
+    const last = this.lines.at(-1);
+    if (last?.role === "system") {
+      last.text += delta;
+    } else {
+      this.lines.push({ role: "system", text: delta });
+    }
+    this.requestRender();
+  }
+
+  handleInput(data: string) {
+    if (data === "\x1b") {
+      this.onEscape?.();
+      return;
+    }
+    this.input.handleInput(data);
+  }
+
+  invalidate() {
+    this.input.invalidate();
+  }
+
+  render(width: number): string[] {
+    this.input.focused = this.focused;
+    const contentWidth = Math.max(20, width - 2);
+    const lines: string[] = [];
+
+    for (const line of this.lines) {
+      const label = line.role === "user" ? "You" : line.role === "assistant" ? "Agent" : "System";
+      const prefix = `${label}: `;
+      const wrapped = wrapTextWithAnsi(line.text || " ", contentWidth - prefix.length);
+      for (const [index, text] of wrapped.entries()) {
+        lines.push(`${index === 0 ? prefix : " ".repeat(prefix.length)}${text}`);
+      }
+      lines.push("");
+    }
+
+    lines.push("-".repeat(Math.max(0, width)));
+    const inputLine = this.input.render(Math.max(1, width - 2))[0] ?? "";
+    lines.push(`> ${inputLine}`);
+    return lines;
+  }
+}
 
 const terminal = new ProcessTerminal();
-const tui = new TUI(terminal);
+const tui = new TUI(terminal, true);
+const screen = new ChatScreen(() => tui.requestRender());
+let running = false;
 
-const root = new Container();
-const transcript = new Container();
-const statusLine = new Text("", 0, 0);
-const input = new Input();
+const runtime = new Runtime({
+  systemPrompt: "You are a testing agent, You are inside a harness that I am developing, help me debug you.",
+  model,
+  tools,
+  getApiKey: async (provider) => {
+    if (provider !== "openai-codex") return undefined;
 
-const uiMessages = new UiMessageList();
-let pendingAssistantIndex: number | null = null;
+    const auth = await loadAuth();
+    const result = await getOAuthApiKey("openai-codex", auth);
+    if (!result) throw new Error("Run `bun run login:codex` first.");
 
-function renderTranscript() {
-  transcript.clear();
-  const messages = uiMessages.getMessages();
-
-  if (messages.length === 0) {
-    transcript.addChild(
-      new Text(
-        [
-          "CodingAgent",
-          "",
-          `Provider: ${provider}`,
-          `Model: ${model.id}`,
-          `OAuth file: ${getAuthFilePath()}`,
-          "",
-          "Enter a message and press Enter to send.",
-          "Press Ctrl+C to exit.",
-        ].join("\n"),
-        0,
-        0,
-      ),
-    );
-    return;
-  }
-
-  for (const message of messages) {
-    const prefix = message.role === "user" ? "You" : "Agent";
-    transcript.addChild(new Text(`${prefix}: ${message.text || "..."}`, 0, 0));
-    transcript.addChild(new Text("", 0, 0));
-  }
-}
-
-function updateStatus(text: string) {
-  statusLine.setText(text);
-}
-
-function refreshUi() {
-  renderTranscript();
-  tui.requestRender();
-}
-
-function getPendingAssistantMessage() {
-  if (pendingAssistantIndex === null) return;
-  return uiMessages.getMessage(pendingAssistantIndex);
-}
-
-async function submitPrompt(value: string) {
-  const prompt = value.trim();
-  if (!prompt || agent.state.isStreaming) return;
-
-  uiMessages.appendMessage("user", prompt);
-  pendingAssistantIndex = uiMessages.appendMessage("assistant", "");
-  input.setValue("");
-  updateStatus("Thinking...");
-  refreshUi();
-
-  try {
-    await agent.prompt(prompt);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const pendingAssistantMessage = getPendingAssistantMessage();
-    if (pendingAssistantMessage) {
-      pendingAssistantMessage.text = `Error: ${message}`;
-      pendingAssistantIndex = null;
+    auth["openai-codex"] = { type: "oauth", ...result.newCredentials };
+    await saveAuth(auth);
+    return result.apiKey;
+  },
+  onEvent: (event) => {
+    if (event.type === "text_delta") screen.appendAssistant(event.delta);
+    if (event.type === "tool_call_start") {
+      screen.addLine({ role: "system", text: `Tool stream[${event.contentIndex}]: ` });
     }
-    updateStatus("Request failed.");
-    refreshUi();
-  }
-}
-
-root.addChild(transcript);
-root.addChild(statusLine);
-root.addChild(input);
-tui.addChild(root);
-tui.setFocus(input);
-
-input.onSubmit = (value) => {
-  void submitPrompt(value);
-};
-
-agent.subscribe((event) => {
-  if (event.type === "message_update") {
-    const pendingAssistantMessage = getPendingAssistantMessage();
-    if (
-      event.assistantMessageEvent.type === "text_delta" &&
-      pendingAssistantMessage
-    ) {
-      pendingAssistantMessage.text += event.assistantMessageEvent.delta;
-      refreshUi();
+    if (event.type === "tool_call_delta") {
+      screen.appendSystem(event.delta);
     }
-    return;
-  }
-
-  if (event.type === "message_end") {
-    const pendingAssistantMessage = getPendingAssistantMessage();
-    if (pendingAssistantMessage && !pendingAssistantMessage.text) {
-      pendingAssistantMessage.text = "(no text response)";
+    if (event.type === "tool_call") {
+      screen.addLine({
+        role: "system",
+        text: `Tool call final: ${event.toolCall.name}\n${JSON.stringify(event.toolCall.arguments, null, 2)}`,
+      });
     }
-    refreshUi();
-    return;
-  }
-
-  if (event.type === "agent_end") {
-    const pendingAssistantMessage = getPendingAssistantMessage();
-    if (agent.state.errorMessage && pendingAssistantMessage) {
-      const current = pendingAssistantMessage.text;
-      pendingAssistantMessage.text = current
-        ? `${current}\n\nError: ${agent.state.errorMessage}`
-        : `Error: ${agent.state.errorMessage}`;
-    }
-    pendingAssistantIndex = null;
-    updateStatus("Ready.");
-    refreshUi();
-  }
+    if (event.type === "runtime_error") screen.addLine({ role: "system", text: event.error });
+  },
 });
 
-tui.addInputListener((data) => {
-  if (matchesKey(data, Key.ctrl("c"))) {
-    agent.abort();
-    tui.stop();
-    process.exit(0);
+async function shutdown() {
+  tui.stop();
+  await terminal.drainInput();
+}
+
+screen.onEscape = () => {
+  void shutdown();
+};
+
+screen.onSubmit = async (text) => {
+  if (text === "/exit" || text === "/quit") {
+    await shutdown();
+    return;
   }
 
+  if (running) {
+    screen.addLine({ role: "system", text: "Still waiting on the current response." });
+    return;
+  }
+
+  running = true;
+  screen.addLine({ role: "user", text });
+  screen.addLine({ role: "assistant", text: "" });
+
+  try {
+    await runtime.prompt(text);
+  } catch (error) {
+    screen.addLine({ role: "system", text: error instanceof Error ? error.message : String(error) });
+  } finally {
+    running = false;
+    tui.requestRender();
+  }
+};
+
+tui.addInputListener((data) => {
+  if (data === "\x03") {
+    void shutdown();
+    return { consume: true };
+  }
   return undefined;
 });
 
-updateStatus("Ready.");
-refreshUi();
+tui.addChild(screen);
+tui.setFocus(screen);
 tui.start();
