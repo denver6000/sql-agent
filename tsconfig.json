@@ -18,6 +18,6 @@
     "noPropertyAccessFromIndexSignature": false,
     "types": ["bun"],
   },
-  "include": ["*.ts", "tools/**/*.ts"],
+  "include": ["*.ts", "tools/**/*.ts", "context/**/*.ts", "ui/**/*.ts"],
   "exclude": ["node_modules", "references", "sessions"],
 }

@@ -11,11 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { getAuthFilePath, resolveOAuthApiKey } from "./auth";
 import { defaultTools } from "./tools";
-
-type ChatMessage = {
-  role: "user" | "assistant";
-  text: string;
-};
+import { UiMessageList } from "./ui/messages";
 
 type RuntimeProvider = "anthropic" | "github-copilot" | "openai-codex";
 
@@ -76,11 +72,12 @@ const transcript = new Container();
 const statusLine = new Text("", 0, 0);
 const input = new Input();
 
-const messages: ChatMessage[] = [];
+const uiMessages = new UiMessageList();
 let pendingAssistantIndex: number | null = null;
 
 function renderTranscript() {
   transcript.clear();
+  const messages = uiMessages.getMessages();
 
   if (messages.length === 0) {
     transcript.addChild(
@@ -118,22 +115,17 @@ function refreshUi() {
   tui.requestRender();
 }
 
-function appendMessage(role: ChatMessage["role"], text: string) {
-  messages.push({ role, text });
-  return messages.length - 1;
-}
-
 function getPendingAssistantMessage() {
   if (pendingAssistantIndex === null) return;
-  return messages[pendingAssistantIndex];
+  return uiMessages.getMessage(pendingAssistantIndex);
 }
 
 async function submitPrompt(value: string) {
   const prompt = value.trim();
   if (!prompt || agent.state.isStreaming) return;
 
-  appendMessage("user", prompt);
-  pendingAssistantIndex = appendMessage("assistant", "");
+  uiMessages.appendMessage("user", prompt);
+  pendingAssistantIndex = uiMessages.appendMessage("assistant", "");
   input.setValue("");
   updateStatus("Thinking...");
   refreshUi();
