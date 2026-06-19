@@ -6,13 +6,16 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 import { Type } from "typebox";
+import { PackageManager } from "./package-manager.js";
 import { Runtime, type RuntimeTool } from "./runtime.js";
 
 type AuthFile = Record<string, OAuthCredentials & { type?: string }>;
 type ChatLine = { role: "user" | "assistant" | "system"; text: string };
 
 const authPath = new URL("./auth.json", import.meta.url);
-const workspaceRoot = process.cwd();
+const packageManager = new PackageManager({ cwd: process.cwd() });
+const runtimePackage = await packageManager.discover();
+const workspaceRoot = runtimePackage.workspaceRoot;
 const execFileAsync = promisify(execFile);
 const model = getModel("openai-codex", "gpt-5.4-mini");
 const tools: RuntimeTool[] = [
@@ -171,6 +174,7 @@ const runtime = new Runtime({
   systemPrompt: "You are a testing agent, You are inside a harness that I am developing, help me debug you.",
   model,
   tools,
+  runtimePackage,
   getApiKey: async (provider) => {
     if (provider !== "openai-codex") return undefined;
 
@@ -210,6 +214,11 @@ const runtime = new Runtime({
     }
     if (event.type === "runtime_error") screen.addLine({ role: "system", text: event.error });
   },
+});
+
+screen.addLine({
+  role: "system",
+  text: `Workspace: ${workspaceRoot}\nInstructions: ${runtimePackage.instructions.length}\nSkills: ${runtimePackage.skills.length}`,
 });
 
 async function shutdown() {

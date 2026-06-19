@@ -10,6 +10,7 @@ import {
   type ToolResultMessage,
 } from "@mariozechner/pi-ai";
 import { BasicContextBuilder, type ContextBuilder } from "./context-builder.js";
+import type { RuntimePackage } from "./package-manager.js";
 
 export type ToolExecutionContext = {
   toolCall: ToolCall;
@@ -54,6 +55,7 @@ export type RuntimeOptions = {
   maxIterations?: number;
   toolResolver?: ToolResolver;
   contextBuilder?: ContextBuilder;
+  runtimePackage?: RuntimePackage;
   sessionId?: string;
   getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
   onEvent?: (event: RuntimeEvent) => Promise<void> | void;
@@ -66,6 +68,7 @@ export class Runtime {
   private readonly maxIterations: number;
   private readonly toolResolver: ToolResolver;
   private readonly contextBuilder: ContextBuilder;
+  private readonly runtimePackage?: RuntimePackage;
   private readonly sessionId?: string;
   private readonly getApiKey?: RuntimeOptions["getApiKey"];
   private readonly onEvent?: RuntimeOptions["onEvent"];
@@ -77,7 +80,9 @@ export class Runtime {
     this.tools = options.tools ?? [];
     this.maxIterations = options.maxIterations ?? 8;
     this.toolResolver = options.toolResolver ?? new RuntimeToolRegistry(this.tools);
-    this.contextBuilder = options.contextBuilder ?? new BasicContextBuilder();
+    this.runtimePackage = options.runtimePackage;
+    this.contextBuilder =
+      options.contextBuilder ?? new BasicContextBuilder({ runtimePackage: options.runtimePackage });
     this.sessionId = options.sessionId;
     this.getApiKey = options.getApiKey;
     this.onEvent = options.onEvent;
@@ -99,6 +104,7 @@ export class Runtime {
         systemPrompt: this.systemPrompt,
         messages: this.messages,
         tools: this.tools.map(toToolSpec),
+        runtimePackage: this.runtimePackage,
       });
 
       const stream = streamSimple(this.model, context, {
