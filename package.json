@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "bun run index.ts",
+    "start:sql-local": "bun run scripts/run-sql-local.ts",
     "providers": "pi-ai list",
     "login": "pi-ai login",
     "login:codex": "bun run login.ts",
@@ -21,6 +22,7 @@
   "dependencies": {
     "@earendil-works/pi-tui": "^0.79.7",
     "@mariozechner/pi-ai": "^0.73.1",
+    "mysql2": "^3.22.5",
     "typebox": "^1.2.16"
   }
 }

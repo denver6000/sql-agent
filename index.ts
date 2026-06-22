@@ -1,13 +1,19 @@
 import { getModel } from "@mariozechner/pi-ai";
 import { getOAuthApiKey, type OAuthCredentials } from "@mariozechner/pi-ai/oauth";
 import { Input, ProcessTerminal, TUI, type Component, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Type } from "typebox";
 import { PackageManager } from "./package-manager.js";
 import { Runtime, type RuntimeTool } from "./runtime.js";
+import { createSqlWorkspaceTool } from "./tools/sql-workspace/index.js";
+import { SqlWorkspaceRunner } from "./tools/sql-workspace/runner.js";
+import { SqlRuntime, type SqlRuntimeBackend } from "./tools/sql-runtime/runtime.js";
+import { startSqlRuntimeServer } from "./tools/sql-runtime/server.js";
 
 type AuthFile = Record<string, OAuthCredentials & { type?: string }>;
 type ChatLine = { role: "user" | "assistant" | "system"; text: string };
@@ -18,11 +24,29 @@ const runtimePackage = await packageManager.discover();
 const workspaceRoot = runtimePackage.workspaceRoot;
 const execFileAsync = promisify(execFile);
 const model = getModel("openai-codex", "gpt-5.4-mini");
+const sqlWorkspaceBackend = (process.env.SQL_WORKSPACE_BACKEND ?? "scaffold") as SqlRuntimeBackend;
+const sqlRuntime = new SqlRuntime({
+  backend: sqlWorkspaceBackend,
+  host: process.env.SQL_HOST ?? "127.0.0.1",
+  port: process.env.SQL_PORT ?? "3306",
+  user: process.env.SQL_USER ?? "root",
+  password: process.env.SQL_PASSWORD ?? "",
+  database: process.env.SQL_DATABASE ?? "",
+});
+const sqlRuntimeServer = await startSqlRuntimeServer({ runtime: sqlRuntime });
+const sqlWorkspaceRunner = new SqlWorkspaceRunner({
+  pythonPath: process.env.PYTHON ?? "python",
+  workerPath: fileURLToPath(new URL("./tools/sql-workspace/worker.py", import.meta.url)),
+  sessionId: randomUUID(),
+  runtimeUrl: sqlRuntimeServer.url,
+  runtimeToken: sqlRuntimeServer.token,
+});
 const tools: RuntimeTool[] = [
+  createSqlWorkspaceTool({ runner: sqlWorkspaceRunner }),
   {
     name: "bash",
     description:
-      "Run a shell command in the current project workspace. Use this for inspecting files, running builds, tests, and other terminal commands.",
+      "Run a shell command in the current project workspace. Use this for inspecting files, running builds, tests, and other terminal commands. Do not use this for SQL database/schema/table/row work; use sql_workspace_run for database work.",
     parameters: Type.Object({
       command: Type.String({ description: "The shell command to run." }),
       timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds." })),
@@ -45,7 +69,7 @@ const tools: RuntimeTool[] = [
   },
   {
     name: "read_file",
-    description: "Read a text file from the current project workspace.",
+    description: "Read a text file from the current project workspace. Do not use this for SQL database/schema/table/row work; use sql_workspace_run for database work.",
     parameters: Type.Object({
       path: Type.String({ description: "Path to the file to read, relative to the workspace when possible." }),
       startLine: Type.Optional(Type.Number({ description: "Optional 1-based line number to start reading from." })),
@@ -63,7 +87,7 @@ const tools: RuntimeTool[] = [
   },
   {
     name: "write_file",
-    description: "Write text content to a file in the current project workspace.",
+    description: "Write text content to a file in the current project workspace. Do not use this for SQL database/schema/table/row work; use sql_workspace_run for database work.",
     parameters: Type.Object({
       path: Type.String({ description: "Path to the file to write, relative to the workspace when possible." }),
       content: Type.String({ description: "Full file content to write." }),
@@ -218,10 +242,20 @@ const runtime = new Runtime({
 
 screen.addLine({
   role: "system",
-  text: `Workspace: ${workspaceRoot}\nInstructions: ${runtimePackage.instructions.length}\nSkills: ${runtimePackage.skills.length}`,
+  text: [
+    `Workspace: ${workspaceRoot}`,
+    `Instructions: ${runtimePackage.instructions.length}`,
+    `Skills: ${runtimePackage.skills.length}`,
+    `Tools: ${tools.map((tool) => tool.name).join(", ")}`,
+    `SQL runtime: ${sqlWorkspaceBackend}`,
+    `SQL database: ${process.env.SQL_DATABASE || "(none selected)"}`,
+  ].join("\n"),
 });
 
 async function shutdown() {
+  sqlWorkspaceRunner.stop();
+  await sqlRuntimeServer.close();
+  await sqlRuntime.close();
   tui.stop();
   await terminal.drainInput();
 }
