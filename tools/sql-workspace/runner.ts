@@ -1,28 +1,17 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createInterface } from "node:readline";
 import { NoopRuntimeLogger, type RuntimeLogger } from "../../logging.js";
+import {
+  SqlWorkspaceWorkerManager,
+  type SqlWorkspaceWorkerRequest,
+  type SqlWorkspaceWorkerResponse,
+} from "./worker_manager.js";
 
 export type SqlWorkspaceRunnerOptions = {
-  pythonPath: string;
-  workerPath: string;
-  sessionId: string;
-  runtimeUrl?: string;
-  runtimeToken?: string;
-  env?: Record<string, string | undefined>;
-  startupTimeoutMs?: number;
+  worker: SqlWorkspaceWorkerManager;
   logger?: RuntimeLogger;
 };
 
-export type SqlWorkspaceExecutionResult = {
-  id: string;
-  ok: boolean;
-  stdout: string;
-  stderr: string;
-  error?: string;
-  namespaceKeys: string[];
-  sqlStatus?: unknown;
-};
+export type SqlWorkspaceExecutionResult = SqlWorkspaceWorkerResponse;
 
 type PendingExecution = {
   resolve: (response: SqlWorkspaceExecutionResult) => void;
@@ -31,110 +20,19 @@ type PendingExecution = {
 };
 
 export class SqlWorkspaceRunner {
-
-  
-  private child?: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<string, PendingExecution>();
   private readonly logger: RuntimeLogger;
+  private readonly worker: SqlWorkspaceWorkerManager;
 
   constructor(private readonly options: SqlWorkspaceRunnerOptions) {
     this.logger = options.logger ?? new NoopRuntimeLogger();
+    this.worker = options.worker;
+    this.worker.onResponse((response) => this.resolveExecution(response));
+    this.worker.onFailure((error) => this.rejectAll(error));
   }
 
   start() {
-    if (this.child) return;
-
-    void this.logger.log({
-      level: "info",
-      event: "function_call_start",
-      className: "SqlWorkspaceRunner",
-      functionName: "start",
-      params: {
-        pythonPath: this.options.pythonPath,
-        workerPath: this.options.workerPath,
-        sessionId: this.options.sessionId,
-        runtimeUrl: this.options.runtimeUrl,
-        runtimeToken: this.options.runtimeToken,
-        env: this.options.env,
-      },
-    });
-
-    this.child = spawn(this.options.pythonPath, [this.options.workerPath], {
-      stdio: "pipe",
-      env: {
-        ...process.env,
-        ...this.options.env,
-        SQL_WORKSPACE_SESSION_ID: this.options.sessionId,
-        SQL_RUNTIME_URL: this.options.runtimeUrl ?? "not-configured",
-        SQL_RUNTIME_TOKEN: this.options.runtimeToken ?? "",
-      },
-    });
-
-    const lines = createInterface({ input: this.child.stdout });
-    lines.on("line", (line) => {
-      let response: SqlWorkspaceExecutionResult;
-      try {
-        response = JSON.parse(line) as SqlWorkspaceExecutionResult;
-      } catch (error) {
-        void this.logger.log({
-          level: "error",
-          event: "worker_invalid_json",
-          className: "SqlWorkspaceRunner",
-          functionName: "start",
-          params: { line },
-          error,
-        });
-        this.rejectAll(new Error(`SQL workspace worker returned invalid JSON: ${line}`));
-        return;
-      }
-
-      const pending = this.pending.get(response.id);
-      if (!pending) {
-        void this.logger.log({
-          level: "warn",
-          event: "worker_unmatched_response",
-          className: "SqlWorkspaceRunner",
-          functionName: "start",
-          returnValue: response,
-        });
-        return;
-      }
-      clearTimeout(pending.timeout);
-      this.pending.delete(response.id);
-      pending.resolve(response);
-    });
-
-    this.child.on("error", (error) => {
-      void this.logger.log({
-        level: "error",
-        event: "worker_process_error",
-        className: "SqlWorkspaceRunner",
-        functionName: "start",
-        error,
-      });
-      this.rejectAll(error instanceof Error ? error : new Error(String(error)));
-      this.child = undefined;
-    });
-
-    this.child.on("exit", (code, signal) => {
-      void this.logger.log({
-        level: "warn",
-        event: "worker_process_exit",
-        className: "SqlWorkspaceRunner",
-        functionName: "start",
-        returnValue: { code, signal },
-      });
-      this.rejectAll(new Error(`SQL workspace worker exited with code=${code} signal=${signal}`));
-      this.child = undefined;
-    });
-
-    void this.logger.log({
-      level: "info",
-      event: "function_call_return",
-      className: "SqlWorkspaceRunner",
-      functionName: "start",
-      returnValue: { pid: this.child.pid },
-    });
+    this.worker.start();
   }
 
   execute(code: string, timeoutMs = 30_000): Promise<SqlWorkspaceExecutionResult> {
@@ -149,14 +47,8 @@ export class SqlWorkspaceRunner {
   }
 
   private executeInternal(code: string, timeoutMs = 30_000): Promise<SqlWorkspaceExecutionResult> {
-    this.start();
-
-    if (!this.child) {
-      throw new Error("SQL workspace worker failed to start.");
-    }
-
     const id = randomUUID();
-    const payload = JSON.stringify({ id, type: "execute", code });
+    const request: SqlWorkspaceWorkerRequest = { id, type: "execute", code };
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -165,7 +57,13 @@ export class SqlWorkspaceRunner {
       }, timeoutMs);
 
       this.pending.set(id, { resolve, reject, timeout });
-      this.child?.stdin.write(`${payload}\n`);
+      try {
+        this.worker.send(request);
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -184,9 +82,6 @@ export class SqlWorkspaceRunner {
     }
     this.pending.clear();
 
-    this.child?.kill();
-    this.child = undefined;
-
     void this.logger.log({
       level: "info",
       event: "function_call_return",
@@ -194,6 +89,24 @@ export class SqlWorkspaceRunner {
       functionName: "stop",
       returnValue: { stopped: true },
     });
+  }
+
+  private resolveExecution(response: SqlWorkspaceExecutionResult) {
+    const pending = this.pending.get(response.id);
+    if (!pending) {
+      void this.logger.log({
+        level: "warn",
+        event: "worker_unmatched_response",
+        className: "SqlWorkspaceRunner",
+        functionName: "resolveExecution",
+        returnValue: response,
+      });
+      return;
+    }
+
+    clearTimeout(pending.timeout);
+    this.pending.delete(response.id);
+    pending.resolve(response);
   }
 
   private rejectAll(error: Error) {

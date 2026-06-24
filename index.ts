@@ -12,6 +12,7 @@ import { PackageManager } from "./package-manager.js";
 import { Runtime, type RuntimeTool } from "./runtime.js";
 import { createSqlWorkspaceTool } from "./tools/sql-workspace/index.js";
 import { SqlWorkspaceRunner } from "./tools/sql-workspace/runner.js";
+import { SqlWorkspaceWorkerManager } from "./tools/sql-workspace/worker_manager.js";
 import { SqlRuntime, type SqlRuntimeBackend } from "./tools/sql-runtime/runtime.js";
 import { startSqlRuntimeServer } from "./tools/sql-runtime/server.js";
 import { createDefaultLogPath, JsonlRuntimeLogger } from "./logging.js";
@@ -58,12 +59,18 @@ const sqlRuntime = new SqlRuntime({
   logger,
 });
 const sqlRuntimeServer = await startSqlRuntimeServer({ runtime: sqlRuntime, logger });
-const sqlWorkspaceRunner = new SqlWorkspaceRunner({
+const sqlWorkspaceSessionId = randomUUID();
+const sqlWorkspaceWorker = new SqlWorkspaceWorkerManager({
   pythonPath: process.env.PYTHON ?? "python",
   workerPath: fileURLToPath(new URL("./tools/sql-workspace/worker.py", import.meta.url)),
-  sessionId: randomUUID(),
+  sessionId: sqlWorkspaceSessionId,
   runtimeUrl: sqlRuntimeServer.url,
   runtimeToken: sqlRuntimeServer.token,
+  logger,
+});
+sqlWorkspaceWorker.start();
+const sqlWorkspaceRunner = new SqlWorkspaceRunner({
+  worker: sqlWorkspaceWorker,
   logger,
 });
 const tools: RuntimeTool[] = [
@@ -346,6 +353,7 @@ async function shutdown() {
     },
     async () => {
       sqlWorkspaceRunner.stop();
+      sqlWorkspaceWorker.stop();
       await sqlRuntimeServer.close();
       await sqlRuntime.close();
       tui.stop();
