@@ -11,6 +11,7 @@ import {
 } from "@mariozechner/pi-ai";
 import { BasicContextBuilder, type ContextBuilder } from "./context-builder.js";
 import type { RuntimePackage } from "./package-manager.js";
+import { NoopRuntimeLogger, type RuntimeLogger } from "./logging.js";
 
 export type ToolExecutionContext = {
   toolCall: ToolCall;
@@ -59,6 +60,7 @@ export type RuntimeOptions = {
   sessionId?: string;
   getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
   onEvent?: (event: RuntimeEvent) => Promise<void> | void;
+  logger?: RuntimeLogger;
 };
 
 export class Runtime {
@@ -72,6 +74,7 @@ export class Runtime {
   private readonly sessionId?: string;
   private readonly getApiKey?: RuntimeOptions["getApiKey"];
   private readonly onEvent?: RuntimeOptions["onEvent"];
+  private readonly logger: RuntimeLogger;
   private readonly messages: Message[] = [];
 
   constructor(options: RuntimeOptions) {
@@ -86,6 +89,7 @@ export class Runtime {
     this.sessionId = options.sessionId;
     this.getApiKey = options.getApiKey;
     this.onEvent = options.onEvent;
+    this.logger = options.logger ?? new NoopRuntimeLogger();
   }
 
   get transcript() {
@@ -93,6 +97,21 @@ export class Runtime {
   }
 
   async prompt(text: string, signal?: AbortSignal) {
+    return this.logger.trace(
+      {
+        className: "Runtime",
+        functionName: "prompt",
+        params: {
+          text,
+          hasSignal: Boolean(signal),
+          transcriptLength: this.messages.length,
+        },
+      },
+      () => this.promptInternal(text, signal),
+    );
+  }
+
+  private async promptInternal(text: string, signal?: AbortSignal) {
     const userMessage: Message = { role: "user", content: text, timestamp: Date.now() };
     this.messages.push(userMessage);
     await this.emit({ type: "user_message", message: userMessage });
@@ -163,19 +182,28 @@ export class Runtime {
   }
 
   private async executeToolCall(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResultMessage> {
-    await this.emit({ type: "tool_execution_start", toolCall });
+    return this.logger.trace(
+      {
+        className: "Runtime",
+        functionName: "executeToolCall",
+        params: { toolCall, hasSignal: Boolean(signal) },
+      },
+      async () => {
+        await this.emit({ type: "tool_execution_start", toolCall });
 
-    const tool = this.toolResolver.resolve(toolCall.name);
-    if (!tool?.execute) {
-      return createToolResultMessage(toolCall, `No executable tool registered for '${toolCall.name}'.`, true);
-    }
+        const tool = this.toolResolver.resolve(toolCall.name);
+        if (!tool?.execute) {
+          return createToolResultMessage(toolCall, `No executable tool registered for '${toolCall.name}'.`, true);
+        }
 
-    try {
-      const result = await tool.execute(toolCall.arguments, { toolCall, signal });
-      return createToolResultMessage(toolCall, result);
-    } catch (error) {
-      return createToolResultMessage(toolCall, error instanceof Error ? error.message : String(error), true);
-    }
+        try {
+          const result = await tool.execute(toolCall.arguments, { toolCall, signal });
+          return createToolResultMessage(toolCall, result);
+        } catch (error) {
+          return createToolResultMessage(toolCall, error instanceof Error ? error.message : String(error), true);
+        }
+      },
+    );
   }
 }
 
