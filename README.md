@@ -1,6 +1,6 @@
 # SQL Agent
 
-SQL Agent built on top of `pi-ai`.
+SQL Agent built on top of `pi-agent-core` and `pi-ai`.
 
 This is a local SQL agent runtime for experimenting with agent-driven database exploration. It is intended for local development and learning, and has not been tested in a production environment.
 
