@@ -12,6 +12,7 @@ coverage
 
 # logs
 logs
+sessions/*/runtime-log.jsonl
 _.log
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
@@ -22,6 +23,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.production.local
 .env.local
 auth.json
+config/sql-credentials.local.json
 
 # caches
 .eslintcache

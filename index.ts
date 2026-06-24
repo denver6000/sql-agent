@@ -14,6 +14,8 @@ import { createSqlWorkspaceTool } from "./tools/sql-workspace/index.js";
 import { SqlWorkspaceRunner } from "./tools/sql-workspace/runner.js";
 import { SqlRuntime, type SqlRuntimeBackend } from "./tools/sql-runtime/runtime.js";
 import { startSqlRuntimeServer } from "./tools/sql-runtime/server.js";
+import { createDefaultLogPath, JsonlRuntimeLogger } from "./logging.js";
+import { resolveSqlRuntimeConfig } from "./sql-credentials.js";
 
 type AuthFile = Record<string, OAuthCredentials & { type?: string }>;
 type ChatLine = { role: "user" | "assistant" | "system"; text: string };
@@ -22,27 +24,50 @@ const authPath = new URL("./auth.json", import.meta.url);
 const packageManager = new PackageManager({ cwd: process.cwd() });
 const runtimePackage = await packageManager.discover();
 const workspaceRoot = runtimePackage.workspaceRoot;
+const logPath = process.env.RUNTIME_LOG_PATH ?? createDefaultLogPath(workspaceRoot);
+const logger = new JsonlRuntimeLogger({ path: logPath });
 const execFileAsync = promisify(execFile);
 const model = getModel("openai-codex", "gpt-5.4-mini");
-const sqlWorkspaceBackend = (process.env.SQL_WORKSPACE_BACKEND ?? "scaffold") as SqlRuntimeBackend;
+const sqlConfig = await resolveSqlRuntimeConfig();
+const sqlWorkspaceBackend = sqlConfig.backend as SqlRuntimeBackend;
+await logger.log({
+  level: "info",
+  event: "app_start",
+  className: "Index",
+  functionName: "main",
+  params: {
+    workspaceRoot,
+    logPath,
+    sqlWorkspaceBackend,
+    sqlCredentialsPath: sqlConfig.credentialsPath,
+    sqlCredentialsLoaded: sqlConfig.credentialsLoaded,
+    sqlHost: sqlConfig.host,
+    sqlPort: sqlConfig.port,
+    sqlUser: sqlConfig.user,
+    sqlPassword: sqlConfig.password,
+    sqlDatabase: sqlConfig.database,
+  },
+});
 const sqlRuntime = new SqlRuntime({
   backend: sqlWorkspaceBackend,
-  host: process.env.SQL_HOST ?? "127.0.0.1",
-  port: process.env.SQL_PORT ?? "3306",
-  user: process.env.SQL_USER ?? "root",
-  password: process.env.SQL_PASSWORD ?? "",
-  database: process.env.SQL_DATABASE ?? "",
+  host: sqlConfig.host,
+  port: sqlConfig.port,
+  user: sqlConfig.user,
+  password: sqlConfig.password,
+  database: sqlConfig.database,
+  logger,
 });
-const sqlRuntimeServer = await startSqlRuntimeServer({ runtime: sqlRuntime });
+const sqlRuntimeServer = await startSqlRuntimeServer({ runtime: sqlRuntime, logger });
 const sqlWorkspaceRunner = new SqlWorkspaceRunner({
   pythonPath: process.env.PYTHON ?? "python",
   workerPath: fileURLToPath(new URL("./tools/sql-workspace/worker.py", import.meta.url)),
   sessionId: randomUUID(),
   runtimeUrl: sqlRuntimeServer.url,
   runtimeToken: sqlRuntimeServer.token,
+  logger,
 });
 const tools: RuntimeTool[] = [
-  createSqlWorkspaceTool({ runner: sqlWorkspaceRunner }),
+  createSqlWorkspaceTool({ runner: sqlWorkspaceRunner, logger }),
   {
     name: "bash",
     description:
@@ -52,19 +77,28 @@ const tools: RuntimeTool[] = [
       timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds." })),
     }),
     execute: async (args) => {
-      const command = requireString(args.command, "command");
-      const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : 30_000;
-      const shell = process.platform === "win32" ? "powershell.exe" : "sh";
-      const shellArgs =
-        process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
+      return logger.trace(
+        {
+          className: "InlineTool",
+          functionName: "bash.execute",
+          params: args,
+        },
+        async () => {
+          const command = requireString(args.command, "command");
+          const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : 30_000;
+          const shell = process.platform === "win32" ? "powershell.exe" : "sh";
+          const shellArgs =
+            process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
 
-      const { stdout, stderr } = await execFileAsync(shell, shellArgs, {
-        cwd: workspaceRoot,
-        timeout: timeoutMs,
-        maxBuffer: 1024 * 1024,
-      });
+          const { stdout, stderr } = await execFileAsync(shell, shellArgs, {
+            cwd: workspaceRoot,
+            timeout: timeoutMs,
+            maxBuffer: 1024 * 1024,
+          });
 
-      return trimToolOutput([stdout, stderr && `stderr:\n${stderr}`].filter(Boolean).join("\n"));
+          return trimToolOutput([stdout, stderr && `stderr:\n${stderr}`].filter(Boolean).join("\n"));
+        },
+      );
     },
   },
   {
@@ -76,13 +110,22 @@ const tools: RuntimeTool[] = [
       lineLimit: Type.Optional(Type.Number({ description: "Optional maximum number of lines to read." })),
     }),
     execute: async (args) => {
-      const path = resolveWorkspacePath(requireString(args.path, "path"));
-      const text = await readFile(path, "utf8");
-      const startLine = typeof args.startLine === "number" ? Math.max(1, Math.floor(args.startLine)) : 1;
-      const lineLimit = typeof args.lineLimit === "number" ? Math.max(1, Math.floor(args.lineLimit)) : undefined;
-      const lines = text.split(/\r?\n/);
-      const selected = lines.slice(startLine - 1, lineLimit ? startLine - 1 + lineLimit : undefined);
-      return trimToolOutput(selected.map((line, index) => `${startLine + index}: ${line}`).join("\n"));
+      return logger.trace(
+        {
+          className: "InlineTool",
+          functionName: "read_file.execute",
+          params: args,
+        },
+        async () => {
+          const path = resolveWorkspacePath(requireString(args.path, "path"));
+          const text = await readFile(path, "utf8");
+          const startLine = typeof args.startLine === "number" ? Math.max(1, Math.floor(args.startLine)) : 1;
+          const lineLimit = typeof args.lineLimit === "number" ? Math.max(1, Math.floor(args.lineLimit)) : undefined;
+          const lines = text.split(/\r?\n/);
+          const selected = lines.slice(startLine - 1, lineLimit ? startLine - 1 + lineLimit : undefined);
+          return trimToolOutput(selected.map((line, index) => `${startLine + index}: ${line}`).join("\n"));
+        },
+      );
     },
   },
   {
@@ -93,11 +136,20 @@ const tools: RuntimeTool[] = [
       content: Type.String({ description: "Full file content to write." }),
     }),
     execute: async (args) => {
-      const path = resolveWorkspacePath(requireString(args.path, "path"));
-      const content = requireString(args.content, "content");
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, content, "utf8");
-      return `Wrote ${content.length} characters to ${path}.`;
+      return logger.trace(
+        {
+          className: "InlineTool",
+          functionName: "write_file.execute",
+          params: args,
+        },
+        async () => {
+          const path = resolveWorkspacePath(requireString(args.path, "path"));
+          const content = requireString(args.content, "content");
+          await mkdir(dirname(path), { recursive: true });
+          await writeFile(path, content, "utf8");
+          return `Wrote ${content.length} characters to ${path}.`;
+        },
+      );
     },
   },
 ];
@@ -200,7 +252,24 @@ const runtime = new Runtime({
   tools,
   runtimePackage,
   getApiKey: async (provider) => {
-    if (provider !== "openai-codex") return undefined;
+    await logger.log({
+      level: "debug",
+      event: "function_call_start",
+      className: "Index",
+      functionName: "getApiKey",
+      params: { provider },
+    });
+
+    if (provider !== "openai-codex") {
+      await logger.log({
+        level: "debug",
+        event: "function_call_return",
+        className: "Index",
+        functionName: "getApiKey",
+        returnValue: { hasApiKey: false },
+      });
+      return undefined;
+    }
 
     const auth = await loadAuth();
     const result = await getOAuthApiKey("openai-codex", auth);
@@ -208,9 +277,23 @@ const runtime = new Runtime({
 
     auth["openai-codex"] = { type: "oauth", ...result.newCredentials };
     await saveAuth(auth);
+    await logger.log({
+      level: "debug",
+      event: "function_call_return",
+      className: "Index",
+      functionName: "getApiKey",
+      returnValue: { hasApiKey: true },
+    });
     return result.apiKey;
   },
   onEvent: (event) => {
+    void logger.log({
+      level: "debug",
+      event: "runtime_event",
+      className: "Index",
+      functionName: "onEvent",
+      params: event,
+    });
     if (event.type === "text_delta") screen.appendAssistant(event.delta);
     if (event.type === "tool_call_start") {
       screen.addLine({ role: "system", text: `Tool stream[${event.contentIndex}]: ` });
@@ -248,16 +331,28 @@ screen.addLine({
     `Skills: ${runtimePackage.skills.length}`,
     `Tools: ${tools.map((tool) => tool.name).join(", ")}`,
     `SQL runtime: ${sqlWorkspaceBackend}`,
-    `SQL database: ${process.env.SQL_DATABASE || "(none selected)"}`,
+    `SQL credentials: ${sqlConfig.credentialsLoaded ? sqlConfig.credentialsPath : "(none loaded)"}`,
+    `SQL database: ${sqlConfig.database || "(none selected)"}`,
+    `Log file: ${logPath}`,
   ].join("\n"),
 });
 
 async function shutdown() {
-  sqlWorkspaceRunner.stop();
-  await sqlRuntimeServer.close();
-  await sqlRuntime.close();
-  tui.stop();
-  await terminal.drainInput();
+  await logger.trace(
+    {
+      className: "Index",
+      functionName: "shutdown",
+      params: {},
+    },
+    async () => {
+      sqlWorkspaceRunner.stop();
+      await sqlRuntimeServer.close();
+      await sqlRuntime.close();
+      tui.stop();
+      await terminal.drainInput();
+      return { stopped: true };
+    },
+  );
 }
 
 screen.onEscape = () => {
@@ -265,6 +360,14 @@ screen.onEscape = () => {
 };
 
 screen.onSubmit = async (text) => {
+  await logger.log({
+    level: "info",
+    event: "user_submit",
+    className: "ChatScreen",
+    functionName: "onSubmit",
+    params: { text, running },
+  });
+
   if (text === "/exit" || text === "/quit") {
     await shutdown();
     return;

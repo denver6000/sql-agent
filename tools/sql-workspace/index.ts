@@ -1,13 +1,17 @@
 import { Type } from "typebox";
 import type { RuntimeTool } from "../../runtime.js";
 import { SqlWorkspaceRunner } from "./runner.js";
+import { NoopRuntimeLogger, type RuntimeLogger } from "../../logging.js";
 
 export type SqlWorkspaceToolOptions = {
   runner: SqlWorkspaceRunner;
   defaultTimeoutMs?: number;
+  logger?: RuntimeLogger;
 };
 
 export function createSqlWorkspaceTool(options: SqlWorkspaceToolOptions): RuntimeTool {
+  const logger = options.logger ?? new NoopRuntimeLogger();
+
   return {
     name: "sql_workspace_run",
     description: [
@@ -33,15 +37,24 @@ export function createSqlWorkspaceTool(options: SqlWorkspaceToolOptions): Runtim
       })),
     }),
     execute: async (args) => {
-      const code = requireString(args.code, "code");
-      const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : options.defaultTimeoutMs;
-      const result = await options.runner.execute(code, timeoutMs);
+      return logger.trace(
+        {
+          className: "SqlWorkspaceTool",
+          functionName: "execute",
+          params: args,
+        },
+        async () => {
+          const code = requireString(args.code, "code");
+          const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : options.defaultTimeoutMs;
+          const result = await options.runner.execute(code, timeoutMs);
 
-      return {
-        isError: !result.ok,
-        content: formatResult(result),
-        details: result,
-      };
+          return {
+            isError: !result.ok,
+            content: formatResult(result),
+            details: result,
+          };
+        },
+      );
     },
   };
 }

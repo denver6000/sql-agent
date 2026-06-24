@@ -7,6 +7,7 @@
     "build": "tsc",
     "start": "bun run index.ts",
     "start:sql-local": "bun run scripts/run-sql-local.ts",
+    "sql-credentials": "bun run scripts/sql-credentials.ts",
     "providers": "pi-ai list",
     "login": "pi-ai login",
     "login:codex": "bun run login.ts",

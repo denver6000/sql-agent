@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { NoopRuntimeLogger, type RuntimeLogger } from "../../logging.js";
 
 export type SqlWorkspaceRunnerOptions = {
   pythonPath: string;
@@ -10,6 +11,7 @@ export type SqlWorkspaceRunnerOptions = {
   runtimeToken?: string;
   env?: Record<string, string | undefined>;
   startupTimeoutMs?: number;
+  logger?: RuntimeLogger;
 };
 
 export type SqlWorkspaceExecutionResult = {
@@ -29,13 +31,33 @@ type PendingExecution = {
 };
 
 export class SqlWorkspaceRunner {
+
+  
   private child?: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<string, PendingExecution>();
+  private readonly logger: RuntimeLogger;
 
-  constructor(private readonly options: SqlWorkspaceRunnerOptions) {}
+  constructor(private readonly options: SqlWorkspaceRunnerOptions) {
+    this.logger = options.logger ?? new NoopRuntimeLogger();
+  }
 
   start() {
     if (this.child) return;
+
+    void this.logger.log({
+      level: "info",
+      event: "function_call_start",
+      className: "SqlWorkspaceRunner",
+      functionName: "start",
+      params: {
+        pythonPath: this.options.pythonPath,
+        workerPath: this.options.workerPath,
+        sessionId: this.options.sessionId,
+        runtimeUrl: this.options.runtimeUrl,
+        runtimeToken: this.options.runtimeToken,
+        env: this.options.env,
+      },
+    });
 
     this.child = spawn(this.options.pythonPath, [this.options.workerPath], {
       stdio: "pipe",
@@ -54,29 +76,79 @@ export class SqlWorkspaceRunner {
       try {
         response = JSON.parse(line) as SqlWorkspaceExecutionResult;
       } catch (error) {
+        void this.logger.log({
+          level: "error",
+          event: "worker_invalid_json",
+          className: "SqlWorkspaceRunner",
+          functionName: "start",
+          params: { line },
+          error,
+        });
         this.rejectAll(new Error(`SQL workspace worker returned invalid JSON: ${line}`));
         return;
       }
 
       const pending = this.pending.get(response.id);
-      if (!pending) return;
+      if (!pending) {
+        void this.logger.log({
+          level: "warn",
+          event: "worker_unmatched_response",
+          className: "SqlWorkspaceRunner",
+          functionName: "start",
+          returnValue: response,
+        });
+        return;
+      }
       clearTimeout(pending.timeout);
       this.pending.delete(response.id);
       pending.resolve(response);
     });
 
     this.child.on("error", (error) => {
+      void this.logger.log({
+        level: "error",
+        event: "worker_process_error",
+        className: "SqlWorkspaceRunner",
+        functionName: "start",
+        error,
+      });
       this.rejectAll(error instanceof Error ? error : new Error(String(error)));
       this.child = undefined;
     });
 
     this.child.on("exit", (code, signal) => {
+      void this.logger.log({
+        level: "warn",
+        event: "worker_process_exit",
+        className: "SqlWorkspaceRunner",
+        functionName: "start",
+        returnValue: { code, signal },
+      });
       this.rejectAll(new Error(`SQL workspace worker exited with code=${code} signal=${signal}`));
       this.child = undefined;
+    });
+
+    void this.logger.log({
+      level: "info",
+      event: "function_call_return",
+      className: "SqlWorkspaceRunner",
+      functionName: "start",
+      returnValue: { pid: this.child.pid },
     });
   }
 
   execute(code: string, timeoutMs = 30_000): Promise<SqlWorkspaceExecutionResult> {
+    return this.logger.trace(
+      {
+        className: "SqlWorkspaceRunner",
+        functionName: "execute",
+        params: { code, timeoutMs },
+      },
+      () => this.executeInternal(code, timeoutMs),
+    );
+  }
+
+  private executeInternal(code: string, timeoutMs = 30_000): Promise<SqlWorkspaceExecutionResult> {
     this.start();
 
     if (!this.child) {
@@ -98,6 +170,14 @@ export class SqlWorkspaceRunner {
   }
 
   stop() {
+    void this.logger.log({
+      level: "info",
+      event: "function_call_start",
+      className: "SqlWorkspaceRunner",
+      functionName: "stop",
+      params: { pendingCount: this.pending.size },
+    });
+
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
       pending.reject(new Error("SQL workspace runner stopped."));
@@ -106,13 +186,35 @@ export class SqlWorkspaceRunner {
 
     this.child?.kill();
     this.child = undefined;
+
+    void this.logger.log({
+      level: "info",
+      event: "function_call_return",
+      className: "SqlWorkspaceRunner",
+      functionName: "stop",
+      returnValue: { stopped: true },
+    });
   }
 
   private rejectAll(error: Error) {
+    void this.logger.log({
+      level: "warn",
+      event: "function_call_start",
+      className: "SqlWorkspaceRunner",
+      functionName: "rejectAll",
+      params: { pendingCount: this.pending.size, error },
+    });
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
       pending.reject(error);
     }
     this.pending.clear();
+    void this.logger.log({
+      level: "warn",
+      event: "function_call_return",
+      className: "SqlWorkspaceRunner",
+      functionName: "rejectAll",
+      returnValue: { pendingCount: this.pending.size },
+    });
   }
 }
